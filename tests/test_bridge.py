@@ -1,9 +1,13 @@
+import io
 import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
 from agy_telegram_bridge import formatting as fmt
+from agy_telegram_bridge import notify, prompts
 from agy_telegram_bridge.agent import read_new_steps
 from agy_telegram_bridge.config import ConfigError, Settings
 
@@ -114,6 +118,68 @@ class Config(unittest.TestCase):
             Settings.from_env({**self.base, "TELEGRAM_ALLOWED_USERS": "alice"})
         with self.assertRaises(ConfigError):
             Settings.from_env({**self.base, "AGY_TRUST_MODE": "yolo"})
+
+
+class DiscoveryPrompt(unittest.TestCase):
+    def test_prompt_is_bundled_read_only_and_ends_with_parsable_buttons(self):
+        text = prompts.discover_integrations()
+        self.assertIn("Read-only", text)
+        self.assertIn("Never print secrets", text)
+        _, rows = fmt.extract_buttons(text)
+        self.assertGreaterEqual(sum(len(r) for r in rows), 3)
+
+    def test_prompt_contains_no_personal_markers(self):
+        text = prompts.discover_integrations().lower()
+        for marker in ("/home/", "@gmail", "192.168."):
+            self.assertNotIn(marker, text)
+
+
+class EnvExample(unittest.TestCase):
+    path = Path(__file__).resolve().parent.parent / "examples" / "env.example"
+
+    def test_no_inline_comments_and_fillable(self):
+        for line in self.path.read_text().splitlines():
+            if line and not line.startswith("#"):
+                self.assertNotIn(" #", line, f"inline comment would leak into the value: {line}")
+        values = notify.parse_env_file(self.path)
+        values["TELEGRAM_BOT_TOKEN"] = "123:abc"
+        values["TELEGRAM_ALLOWED_USERS"] = "42"
+        self.assertEqual(Settings.from_env(values).allowed_users, frozenset({42}))
+
+
+class Notify(unittest.TestCase):
+    def test_env_file_parsing(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "env"
+            p.write_text('# c\nexport A="1"\nB=two words\n\nbad line\nC=\n')
+            self.assertEqual(notify.parse_env_file(p), {"A": "1", "B": "two words", "C": ""})
+        self.assertEqual(notify.parse_env_file(Path("/nonexistent/env")), {})
+
+    def test_sends_to_every_allowed_user_and_truncates(self):
+        seen = []
+
+        def fake_urlopen(req, timeout):
+            seen.append(json.loads(req.data))
+            return io.BytesIO(b"{}")
+
+        with tempfile.TemporaryDirectory() as d:
+            env = Path(d) / "env"
+            env.write_text("TELEGRAM_BOT_TOKEN=1:abc\nTELEGRAM_ALLOWED_USERS=7,5\n")
+            with mock.patch("urllib.request.urlopen", fake_urlopen), mock.patch.dict("os.environ", {}, clear=True):
+                self.assertEqual(notify.main(["--env-file", str(env), "x" * 5000]), 0)
+        self.assertEqual([m["chat_id"] for m in seen], [5, 7])
+        self.assertTrue(all(len(m["text"]) == 4096 for m in seen))
+
+    def test_http_error_never_leaks_token(self):
+        err = urllib.error.HTTPError("https://api.telegram.org/bot1:SECRET/sendMessage", 401, "no", {}, None)
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(notify.NotifyError) as cm:
+                notify.send("1:SECRET", 1, "hi")
+        self.assertNotIn("SECRET", str(cm.exception))
+
+    def test_missing_config_is_exit_2(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(notify.main(["--env-file", "/nonexistent", "hi"]), 2)
 
 
 if __name__ == "__main__":

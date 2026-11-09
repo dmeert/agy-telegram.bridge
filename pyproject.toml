@@ -19,6 +19,10 @@ classifiers = [
 
 [project.scripts]
 agy-telegram-bridge = "agy_telegram_bridge.bot:main"
+agy-telegram-notify = "agy_telegram_bridge.notify:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+agy_telegram_bridge = ["prompts/*.md"]

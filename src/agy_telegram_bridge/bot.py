@@ -26,6 +26,7 @@ from telegram.ext import (
 )
 
 from . import formatting as fmt
+from . import prompts
 from .agent import Agent, read_new_steps
 from .config import ConfigError, Settings
 from .daemon import DaemonClient
@@ -147,10 +148,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"• Session: <code>{_esc(conv[:8] + '…') if conv else 'none yet'}</code>\n\n"
         "<b>Commands</b>\n"
         "• /session — session &amp; daemon status\n"
-        "• /new [prompt] — start a fresh conversation\n\n"
+        "• /new [prompt] — start a fresh conversation\n"
+        "• /discover — read-only survey of your environment, then integration ideas\n\n"
         "<i>Send any message to prompt the agent.</i>"
     )
-    await _card(update, text, [[InlineKeyboardButton("💬 Session", callback_data="cmd:session")]])
+    await _card(update, text, [[
+        InlineKeyboardButton("💬 Session", callback_data="cmd:session"),
+        InlineKeyboardButton("🔎 Discover", callback_data="cmd:discover"),
+    ]])
 
 
 async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -188,6 +193,20 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await run_turn(app, target, prompt, force_new=True)
 
 
+async def _start_discovery(app: App, target: Message) -> None:
+    await target.reply_text(
+        "🔎 Starting a read-only survey of your environment. This can take a few minutes; "
+        "the agent will propose integrations and wait for your choice before building anything."
+    )
+    await run_turn(app, target, prompts.discover_integrations(), force_new=True)
+
+
+async def discover_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _authorized(update, context) or not update.message:
+        return
+    await _start_discovery(_app(context), update.message)
+
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _authorized(update, context) or not update.message or not update.message.text:
         return
@@ -204,6 +223,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await session_command(update, context)
     elif data == "cmd:start":
         await start_command(update, context)
+    elif data == "cmd:discover":
+        await _start_discovery(app, query.message)
     elif data == "cmd:new":
         app.fresh_next = True
         await query.message.reply_text("✨ Ready. Your next message starts a new thread.")
@@ -362,6 +383,7 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands([
         BotCommand("session", "Session & daemon status"),
         BotCommand("new", "Start a fresh conversation"),
+        BotCommand("discover", "Survey my environment and suggest integrations"),
         BotCommand("help", "Show commands"),
     ])
 
@@ -388,7 +410,7 @@ def build_application(settings: Settings) -> Application:
     )
     application.bot_data["app"] = app_state
     application.add_error_handler(error_handler)
-    for name, handler in (("start", start_command), ("help", start_command), ("session", session_command), ("new", new_command)):
+    for name, handler in (("start", start_command), ("help", start_command), ("session", session_command), ("new", new_command), ("discover", discover_command)):
         application.add_handler(CommandHandler(name, handler))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
