@@ -1,0 +1,21 @@
+# secrets / local config
+.env
+env
+*.env
+config.json
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+
+# logs & editor debris
+*.log
+*.log.*
+*.bak*
+*.old*
+*.swp
+*~

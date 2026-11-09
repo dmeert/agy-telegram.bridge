@@ -1,0 +1,35 @@
+[Unit]
+Description=Antigravity Telegram bridge
+# Adjust to the name of the unit that runs `agy remote-control serve` (see AGY_DAEMON_UNIT).
+After=antigravity-cli-daemon.service
+Wants=antigravity-cli-daemon.service
+
+[Service]
+Type=simple
+# Secrets live here, not in the unit: TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USERS (see examples/env.example).
+EnvironmentFile=%h/.config/agy-telegram-bridge/env
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+ExecStart=%h/.local/share/agy-telegram-bridge/venv/bin/agy-telegram-bridge
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+UMask=0077
+Nice=5
+MemoryHigh=384M
+MemoryMax=512M
+
+# Sandboxing (the bridge only needs $HOME, loopback HTTP, and the `systemctl --user`/`ss` helpers).
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target
