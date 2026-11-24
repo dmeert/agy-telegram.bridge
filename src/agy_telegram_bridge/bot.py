@@ -8,10 +8,10 @@ import json
 import logging
 import socket
 import sys
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Set
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.error import NetworkError, TimedOut
@@ -37,13 +37,25 @@ POLL_INTERVAL = 1.5      # transcript poll period (s)
 TYPING_INTERVAL = 4.0    # Telegram "typing…" lasts ~5 s
 PILL_INTERVAL = 5.0      # min seconds between progress-pill edits (rate limits)
 PAYLOAD_CACHE = 512      # remembered button payloads (callback_data is capped at 64 bytes)
+INLINE_PAYLOAD_MAX = 62  # "p:" + payload fits within Telegram's 64-byte callback_data limit
+IDLE_SETTLE_POLLS = 2    # empty polls after a reply before trusting daemon idle state
 
 
 @dataclass
 class Watch:
     """One live transcript follower per conversation."""
 
+    targets: Deque[Message] = field(default_factory=deque)
     expected_finals: int = 1
+    awaiting_input: bool = False
+    delivered_any: bool = False
+    cancelled: bool = False
+
+    def current_target(self, fallback: Message) -> Message:
+        return self.targets[0] if self.targets else fallback
+
+    def pop_target(self, fallback: Message) -> Message:
+        return self.targets.popleft() if self.targets else fallback
 
 
 @dataclass
@@ -52,18 +64,29 @@ class App:
     agent: Agent
     daemon: DaemonClient
     host: str = field(default_factory=lambda: socket.gethostname().split(".")[0])
-    fresh_next: bool = False  # /new was issued: next message starts a new conversation
+    fresh_users: Set[int] = field(default_factory=set)  # user IDs whose next message starts a new thread
+    user_convs: Dict[int, str] = field(default_factory=dict)
     watches: Dict[str, Watch] = field(default_factory=dict)
+    turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     payloads: "OrderedDict[str, str]" = field(default_factory=OrderedDict)
     _seq: int = 0
 
     def remember(self, text: str) -> str:
+        if len(text.encode("utf-8")) <= INLINE_PAYLOAD_MAX:
+            return f"p:{text}"
         self._seq += 1
         key = f"s:{self._seq}"
         self.payloads[key] = text
         while len(self.payloads) > PAYLOAD_CACHE:
             self.payloads.popitem(last=False)
         return key
+
+    def recall(self, data: str) -> Optional[str]:
+        if data.startswith("p:"):
+            return data[2:]
+        if data.startswith("s:"):
+            return self.payloads.get(data)
+        return None
 
 
 def _app(context: ContextTypes.DEFAULT_TYPE) -> App:
@@ -136,12 +159,26 @@ def _esc(value: Any) -> str:
     return html.escape(str(value))
 
 
+async def _active_conv(app: App, chat_id: int) -> str:
+    cached = app.user_convs.get(chat_id, "")
+    if cached:
+        if cached in app.watches or app.agent.transcript_paths(cached)[0].exists():
+            return cached
+        app.user_convs.pop(chat_id, None)
+    if len(app.settings.allowed_users) == 1:
+        conv = await asyncio.to_thread(app.agent.active_conversation)
+        if conv:
+            app.user_convs[chat_id] = conv
+        return conv
+    return ""
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _authorized(update, context):
         return
     app = _app(context)
     port, ok = await asyncio.to_thread(app.daemon.status)
-    conv = await asyncio.to_thread(app.agent.active_conversation)
+    conv = await _active_conv(app, update.effective_chat.id)
     text = (
         f"{'🟢' if ok else '🔴'} <b>Antigravity</b> · <code>{_esc(app.host)}</code>\n"
         f"• Project: <code>{_esc(app.settings.project_name)}</code> (trust: {_esc(app.settings.trust_mode)})\n"
@@ -149,6 +186,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "<b>Commands</b>\n"
         "• /session — session &amp; daemon status\n"
         "• /new [prompt] — start a fresh conversation\n"
+        "• /cancel — stop streaming the active turn\n"
         "• /discover — read-only survey of your environment, then integration ideas\n\n"
         "<i>Send any message to prompt the agent.</i>"
     )
@@ -163,7 +201,7 @@ async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     app = _app(context)
     port, ok = await asyncio.to_thread(app.daemon.status)
-    conv = await asyncio.to_thread(app.agent.active_conversation)
+    conv = await _active_conv(app, update.effective_chat.id)
     title = await asyncio.to_thread(app.agent.conversation_title, conv) if conv else ""
     lines = [
         f"💬 <b>Session</b> · <code>{_esc(app.host)}</code>\n",
@@ -187,10 +225,23 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     target = update.callback_query.message if update.callback_query else update.message
     prompt = " ".join(context.args or [])
     if not prompt:
-        app.fresh_next = True
+        app.fresh_users.add(target.chat_id)
         await target.reply_text("✨ Ready. Your next message starts a new thread.")
         return
     await run_turn(app, target, prompt, force_new=True)
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _authorized(update, context) or not update.message:
+        return
+    app = _app(context)
+    conv = await _active_conv(app, update.message.chat_id)
+    watch = app.watches.get(conv) if conv else None
+    if not watch:
+        await update.message.reply_text("ℹ️ No active turn is currently streaming.")
+        return
+    watch.cancelled = True
+    await update.message.reply_text("⏹ Stopped streaming this turn. Send `/new` to start a fresh thread.")
 
 
 async def _start_discovery(app: App, target: Message) -> None:
@@ -226,10 +277,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif data == "cmd:discover":
         await _start_discovery(app, query.message)
     elif data == "cmd:new":
-        app.fresh_next = True
+        app.fresh_users.add(query.message.chat_id)
         await query.message.reply_text("✨ Ready. Your next message starts a new thread.")
-    elif data.startswith("s:"):
-        text = app.payloads.get(data)
+    elif data.startswith(("p:", "s:")):
+        text = app.recall(data)
         if text is None:
             await query.message.reply_text("⌛ That button has expired.")
             return
@@ -244,37 +295,62 @@ async def run_turn(app: App, target: Message, text: str, force_new: bool = False
     """Send ``text`` to the agent and stream the reply back into the chat."""
     await _typing(target)
     payload = f"[via Telegram] {text}"
-    conv = "" if (force_new or app.fresh_next) else await asyncio.to_thread(app.agent.active_conversation)
+    chat_id = target.chat_id
 
-    if not conv:
-        conv, err = await asyncio.to_thread(app.agent.start_conversation, payload)
+    async with app.turn_lock:
+        conv = "" if (force_new or chat_id in app.fresh_users) else await _active_conv(app, chat_id)
+
         if not conv:
-            await target.reply_text(f"❌ Could not start a session: {err}"[:fmt.TELEGRAM_LIMIT])
-            return
-        app.fresh_next = False
-        offset = 0
-        await target.reply_text(f"💬 New thread · {conv[:8]}…")
-    else:
-        transcript = app.agent.transcript_paths(conv)[0]
-        try:
-            offset = transcript.stat().st_size
-        except OSError:
-            await target.reply_text("❌ Transcript not found; try /new.")
-            return
-        watch = app.watches.get(conv)
-        if watch:  # a follower is already streaming this conversation: just deliver the message
-            watch.expected_finals += 1
-        ok, err = await asyncio.to_thread(app.agent.send_message, conv, payload)
-        if not ok:
-            if watch:
-                watch.expected_finals -= 1
-            await target.reply_text(f"❌ Dispatch failed: {err}"[:fmt.TELEGRAM_LIMIT])
-            return
-        if watch:
-            await target.reply_text("↪ Sent to the running turn.")
-            return
+            conv, err = await asyncio.to_thread(app.agent.start_conversation, payload)
+            if not conv:
+                await target.reply_text(f"❌ Could not start a session: {err}"[:fmt.TELEGRAM_LIMIT])
+                return
+            app.fresh_users.discard(chat_id)
+            app.user_convs[chat_id] = conv
+            offset = 0
+            await target.reply_text(f"💬 New thread · {conv[:8]}…")
+            watch = app.watches[conv] = Watch(targets=deque([target]))
+        else:
+            watch = app.watches.get(conv)
+            offset = 0
+            if not watch:
+                transcript = app.agent.transcript_paths(conv)[0]
+                try:
+                    offset = transcript.stat().st_size
+                except OSError:
+                    app.user_convs.pop(chat_id, None)
+                    await target.reply_text("❌ Transcript not found; try /new.")
+                    return
 
-    watch = app.watches[conv] = Watch()
+            answering = bool(watch and watch.awaiting_input)
+            if watch:
+                if answering:
+                    watch.awaiting_input = False
+                    if watch.targets:
+                        watch.targets[0] = target
+                    else:
+                        watch.targets.append(target)
+                else:
+                    watch.expected_finals += 1
+                    watch.targets.append(target)
+
+            ok, err = await asyncio.to_thread(app.agent.send_message, conv, payload)
+            if not ok:
+                if watch:
+                    if answering:
+                        watch.awaiting_input = True
+                    else:
+                        watch.expected_finals -= 1
+                        if watch.targets:
+                            watch.targets.pop()
+                await target.reply_text(f"❌ Dispatch failed: {err}"[:fmt.TELEGRAM_LIMIT])
+                return
+            if watch:
+                if not answering:
+                    await target.reply_text("↪ Sent to the running turn.")
+                return
+            watch = app.watches[conv] = Watch(targets=deque([target]))
+
     try:
         await _follow(app, target, conv, offset, watch)
     finally:
@@ -296,6 +372,7 @@ async def _follow(app: App, target: Message, conv: str, offset: int, watch: Watc
     last_label = ""
     status: Optional[Message] = None
     asked: set = set()
+    idle_polls = 0
 
     async def drop_status() -> None:
         nonlocal status
@@ -306,47 +383,79 @@ async def _follow(app: App, target: Message, conv: str, offset: int, watch: Watc
                 pass
             status = None
 
-    while loop.time() < deadline:
+    while loop.time() < deadline and not watch.cancelled:
         await asyncio.sleep(POLL_INTERVAL)
+        if watch.cancelled:
+            break
         now = loop.time()
-        if now - last_typing >= TYPING_INTERVAL:
+        reply_target = watch.current_target(target)
+        if not watch.awaiting_input and now - last_typing >= TYPING_INTERVAL:
             last_typing = now
-            await _typing(target)
+            await _typing(reply_target)
 
         steps, offset = await asyncio.to_thread(read_new_steps, transcript, offset)
+        if not steps:
+            if watch.delivered_any and not watch.awaiting_input and watch.expected_finals > 0:
+                idle_polls += 1
+                if idle_polls >= IDLE_SETTLE_POLLS:
+                    if await asyncio.to_thread(app.agent.is_conversation_idle, conv):
+                        await drop_status()
+                        return
+            continue
+        idle_polls = 0
+
         for step in steps:
+            truncated = step.get("truncated_fields") or []
             calls = step.get("tool_calls") or []
+            if calls and "tool_calls" in truncated:
+                full = await asyncio.to_thread(app.agent.full_step, conv, step.get("step_index"))
+                if full and full.get("tool_calls"):
+                    calls = full["tool_calls"]
+
             if calls:
-                first = calls[0]
-                if first.get("name") == "ask_question" and step.get("step_index") not in asked:
+                ask_calls = [c for c in calls if c.get("name") == "ask_question"]
+                if ask_calls and step.get("step_index") not in asked:
                     asked.add(step.get("step_index"))
+                    watch.awaiting_input = True
                     await drop_status()
-                    await _forward_questions(app, target, first)
-                label = fmt.format_tool_step(first)
+                    for ac in ask_calls:
+                        await _forward_questions(app, reply_target, ac)
+                    continue
+
+                shown = next((c for c in calls if c.get("name") not in ("update_focus", "update_steps")), calls[0])
+                label = fmt.format_tool_step(shown)
                 if label != last_label and now - last_pill >= PILL_INTERVAL:
                     last_label, last_pill = label, now
                     try:
                         if status:
                             await status.edit_text(label, parse_mode="HTML")
                         else:
-                            status = await target.reply_text(label, parse_mode="HTML")
+                            status = await reply_target.reply_text(label, parse_mode="HTML")
                     except Exception:
                         pass
                 continue
 
             content = step.get("content")
-            if step.get("type") == "PLANNER_RESPONSE" and content:
-                if "content" in (step.get("truncated_fields") or []):
+            if step.get("type") == "PLANNER_RESPONSE" and (content or step.get("status") == "ERROR"):
+                if "content" in truncated:
                     content = await asyncio.to_thread(app.agent.full_content, conv, step.get("step_index")) or content
                 await drop_status()
-                text, rows = fmt.extract_buttons(content)
-                await send_reply(target, text, _keyboard(app, rows))
+                out_target = watch.pop_target(target)
+                if not content and step.get("status") == "ERROR":
+                    await send_reply(out_target, "⚠️ The agent encountered an error while processing this turn.")
+                else:
+                    text, rows = fmt.extract_buttons(content or "")
+                    await send_reply(out_target, text, _keyboard(app, rows))
+                watch.delivered_any = True
+                watch.awaiting_input = False
                 watch.expected_finals -= 1
                 if watch.expected_finals <= 0:
                     return
 
     await drop_status()
-    await target.reply_text(
+    if watch.cancelled:
+        return
+    await watch.current_target(target).reply_text(
         f"⏱ No final answer after {app.settings.turn_timeout // 60} min. The agent may still be working; "
         "send a message to check in."
     )
@@ -384,6 +493,7 @@ async def post_init(application: Application) -> None:
         BotCommand("session", "Session & daemon status"),
         BotCommand("new", "Start a fresh conversation"),
         BotCommand("discover", "Survey my environment and suggest integrations"),
+        BotCommand("cancel", "Stop streaming the current turn"),
         BotCommand("help", "Show commands"),
     ])
 
@@ -410,7 +520,14 @@ def build_application(settings: Settings) -> Application:
     )
     application.bot_data["app"] = app_state
     application.add_error_handler(error_handler)
-    for name, handler in (("start", start_command), ("help", start_command), ("session", session_command), ("new", new_command), ("discover", discover_command)):
+    for name, handler in (
+        ("start", start_command),
+        ("help", start_command),
+        ("session", session_command),
+        ("new", new_command),
+        ("cancel", cancel_command),
+        ("discover", discover_command),
+    ):
         application.add_handler(CommandHandler(name, handler))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))

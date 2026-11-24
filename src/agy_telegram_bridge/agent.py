@@ -134,8 +134,18 @@ class Agent:
         row = self._query("SELECT title, step_count FROM conversation_summaries WHERE conversation_id = ?", (conv_id,))
         return f"{row[0] or 'Untitled'} ({row[1] or 0} steps)" if row else ""
 
-    def full_content(self, conv_id: str, step_index: Any) -> str:
-        """Untruncated content of one step, streamed from transcript_full.jsonl."""
+    def is_conversation_idle(self, conv_id: str) -> Optional[bool]:
+        """True when Antigravity marks ``conv_id`` fully idle (or killed); ``None`` if unknown."""
+        row = self._query(
+            "SELECT not_fully_idle, killed FROM conversation_summaries WHERE conversation_id = ?",
+            (conv_id,),
+        )
+        if row is None:
+            return None
+        return bool(row[1]) or not bool(row[0])
+
+    def full_step(self, conv_id: str, step_index: Any) -> Optional[Dict[str, Any]]:
+        """Untruncated step object from ``transcript_full.jsonl``."""
         path = self.transcript_paths(conv_id)[1]
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -145,10 +155,15 @@ class Agent:
                     except ValueError:
                         continue
                     if isinstance(obj, dict) and obj.get("step_index") == step_index:
-                        return obj.get("content") or ""
+                        return obj
         except OSError:
             pass
-        return ""
+        return None
+
+    def full_content(self, conv_id: str, step_index: Any) -> str:
+        """Untruncated content of one step, streamed from transcript_full.jsonl."""
+        step = self.full_step(conv_id, step_index)
+        return (step.get("content") or "") if step else ""
 
     # -- agentapi ------------------------------------------------------------
 
