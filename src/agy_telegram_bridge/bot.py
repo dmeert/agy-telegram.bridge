@@ -380,6 +380,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def post_init(application: Application) -> None:
+    try:
+        await asyncio.to_thread(application.bot_data["app"].agent.ensure_project)
+    except OSError as e:
+        log.error("Could not sync project definition on startup: %s", e)
     await application.bot.set_my_commands([
         BotCommand("session", "Session & daemon status"),
         BotCommand("new", "Start a fresh conversation"),

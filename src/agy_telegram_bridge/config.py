@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -15,7 +15,8 @@ class ConfigError(ValueError):
 
 
 def _xdg(env: Mapping[str, str], var: str, default: str) -> Path:
-    return Path(env.get(var) or Path.home() / default)
+    raw = (env.get(var) or "").strip()
+    return Path(raw).expanduser() if raw else Path.home() / default
 
 
 def _parse_user_ids(raw: str) -> frozenset[int]:
@@ -54,6 +55,7 @@ class Settings:
     csrf_token: Optional[str]
     turn_timeout: int
     log_file: Optional[Path]
+    config_dir: Path = field(default_factory=lambda: Path.home() / ".config" / "agy-telegram-bridge")
 
     @property
     def agentapi_path(self) -> Path:
@@ -73,6 +75,13 @@ class Settings:
 
         token = (env.get("TELEGRAM_BOT_TOKEN") or "").strip()
         if not token:
+            token_file = (env.get("TELEGRAM_BOT_TOKEN_FILE") or "").strip()
+            if token_file:
+                try:
+                    token = Path(token_file).expanduser().read_text(encoding="utf-8").strip()
+                except OSError as e:
+                    raise ConfigError(f"TELEGRAM_BOT_TOKEN_FILE could not be read: {e}") from None
+        if not token:
             raise ConfigError("TELEGRAM_BOT_TOKEN is not set (get one from @BotFather)")
 
         allowed = _parse_user_ids(env.get("TELEGRAM_ALLOWED_USERS", ""))
@@ -86,7 +95,16 @@ class Settings:
         if trust not in TRUST_MODES:
             raise ConfigError(f"AGY_TRUST_MODE must be one of {TRUST_MODES}, got {trust!r}")
 
+        project_id = (env.get("AGY_PROJECT_ID") or "telegram").strip()
+        if not project_id or "/" in project_id or "\\" in project_id or project_id in (".", ".."):
+            raise ConfigError(f"AGY_PROJECT_ID must be a simple identifier, got {project_id!r}")
+
+        turn_timeout = _parse_int(env, "AGY_TURN_TIMEOUT", 3000)
+        if turn_timeout is None or turn_timeout <= 0:
+            raise ConfigError(f"AGY_TURN_TIMEOUT must be a positive integer, got {turn_timeout!r}")
+
         data_home = _xdg(env, "XDG_DATA_HOME", ".local/share")
+        config_home = _xdg(env, "XDG_CONFIG_HOME", ".config")
         log_file = (env.get("AGY_TELEGRAM_LOG_FILE") or "").strip()
 
         return cls(
@@ -94,7 +112,7 @@ class Settings:
             allowed_users=allowed,
             agy_home=Path(env.get("AGY_HOME") or Path.home() / ".gemini" / "antigravity-cli").expanduser(),
             daemon_unit=(env.get("AGY_DAEMON_UNIT") or "antigravity-cli-daemon.service").strip(),
-            project_id=(env.get("AGY_PROJECT_ID") or "telegram").strip(),
+            project_id=project_id,
             project_name=(env.get("AGY_PROJECT_NAME") or "Telegram").strip(),
             trust_mode=trust,
             workspace_dir=Path(
@@ -102,6 +120,7 @@ class Settings:
             ).expanduser(),
             ls_port=_parse_int(env, "AGY_LS_PORT", None),
             csrf_token=(env.get("AGY_CSRF_TOKEN") or "").strip() or None,
-            turn_timeout=_parse_int(env, "AGY_TURN_TIMEOUT", 3000) or 3000,
+            turn_timeout=turn_timeout,
             log_file=Path(log_file).expanduser() if log_file else None,
+            config_dir=config_home / "agy-telegram-bridge",
         )

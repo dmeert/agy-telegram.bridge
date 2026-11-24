@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import sqlite3
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,6 +16,14 @@ from .config import Settings
 from .daemon import DaemonClient
 
 log = logging.getLogger(__name__)
+
+_FULL_ALLOW = ("read_file(*)", "write_file(*)", "read_url(*)", "command(*)", "unsandboxed(*)", "mcp(*)")
+_FULL_SETTINGS: Dict[str, Any] = {
+    "fileAccessPolicy": "AGENT_SETTING_POLICY_ALLOW",
+    "sandboxMode": False,
+    "autoExecutionPolicy": "CASCADE_COMMANDS_AUTO_EXECUTION_EAGER",
+    "artifactReviewMode": "ARTIFACT_REVIEW_MODE_TURBO",
+}
 
 
 def extract_error(proc: subprocess.CompletedProcess) -> str:
@@ -64,38 +74,79 @@ class Agent:
     def ensure_project(self) -> None:
         """Create/refresh the dedicated Antigravity project that isolates Telegram sessions.
 
-        ``restricted`` (default) grants nothing beyond the workspace folder, so the
-        agent falls back to Antigravity's own permission policy. ``full`` pre-approves
-        file access, commands, URLs and MCP tools and disables the sandbox; only use
-        it on a host you are happy for the agent (and anyone with your bot token or
-        Telegram account) to control.
+        ``restricted`` (default) grants nothing beyond the workspace folder, preserving
+        any granular permissions the user granted in the Antigravity UI while removing
+        ``full``-mode wildcards if the trust mode was downgraded. ``full`` pre-approves
+        file access, commands, URLs and MCP tools and disables the sandbox. Both modes
+        explicitly deny agent access to the bridge's own configuration directory so the
+        bot token file on disk cannot be read via file tools.
         """
         self._s.workspace_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        desired: Dict[str, Any] = {
-            "id": self._s.project_id,
-            "name": self._s.project_name,
-            "projectResources": {"resources": [{"folderUri": self._s.workspace_dir.as_uri()}]},
-        }
-        if self._s.trust_mode == "full":
-            desired["permissionGrants"] = {
-                "permissionGrants": {
-                    "allow": ["read_file(*)", "write_file(*)", "read_url(*)", "command(*)", "unsandboxed(*)", "mcp(*)"]
-                }
-            }
-            desired["settings"] = {
-                "fileAccessPolicy": "AGENT_SETTING_POLICY_ALLOW",
-                "sandboxMode": False,
-                "autoExecutionPolicy": "CASCADE_COMMANDS_AUTO_EXECUTION_EAGER",
-                "artifactReviewMode": "ARTIFACT_REVIEW_MODE_TURBO",
-            }
         path = self._s.project_file
+        existing: Dict[str, Any] = {}
         try:
-            if path.exists() and json.loads(path.read_text()) == desired:
-                return
+            if path.exists():
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing = loaded
         except (OSError, ValueError):
             pass
+
+        desired = copy.deepcopy(existing)
+        desired["id"] = self._s.project_id
+        desired["name"] = self._s.project_name
+        desired["projectResources"] = {"resources": [{"folderUri": self._s.workspace_dir.as_uri()}]}
+
+        outer = dict(desired.get("permissionGrants")) if isinstance(desired.get("permissionGrants"), dict) else {}
+        grants = dict(outer.get("permissionGrants")) if isinstance(outer.get("permissionGrants"), dict) else {}
+
+        cfg_dir = str(self._s.config_dir)
+        protected_deny = (f"read_file({cfg_dir})", f"write_file({cfg_dir})")
+        raw_deny = grants.get("deny")
+        existing_deny = [r for r in raw_deny if isinstance(r, str)] if isinstance(raw_deny, list) else []
+        grants["deny"] = list(dict.fromkeys([*existing_deny, *protected_deny]))
+
+        raw_allow = grants.get("allow")
+        existing_allow = [r for r in raw_allow if isinstance(r, str)] if isinstance(raw_allow, list) else []
+        settings = dict(desired.get("settings")) if isinstance(desired.get("settings"), dict) else {}
+
+        if self._s.trust_mode == "full":
+            grants["allow"] = list(dict.fromkeys([*existing_allow, *_FULL_ALLOW]))
+            settings.update(_FULL_SETTINGS)
+        else:
+            cleaned_allow = [r for r in existing_allow if r not in _FULL_ALLOW]
+            if cleaned_allow:
+                grants["allow"] = cleaned_allow
+            else:
+                grants.pop("allow", None)
+            for k, v in _FULL_SETTINGS.items():
+                if settings.get(k) == v:
+                    settings.pop(k, None)
+
+        outer["permissionGrants"] = grants
+        desired["permissionGrants"] = outer
+        if settings:
+            desired["settings"] = settings
+        else:
+            desired.pop("settings", None)
+
+        if existing == desired and path.exists():
+            return
+
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(desired, indent=2))
+        payload = json.dumps(desired, indent=2)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", text=True)
+        try:
+            os.chmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         log.info("Wrote project definition %s (trust mode: %s)", path, self._s.trust_mode)
 
     # -- conversations (read-only view of Antigravity's index) --------------
@@ -164,6 +215,7 @@ class Agent:
 
     def send_message(self, conv_id: str, text: str) -> Tuple[bool, str]:
         try:
+            self.ensure_project()
             proc = self._run(["send-message", f"--title={self._s.project_name}", conv_id, text], timeout=20)
         except (OSError, subprocess.SubprocessError) as e:
             return False, str(e)

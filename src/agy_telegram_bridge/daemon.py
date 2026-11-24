@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 
 _PROBE_PATH = "/exa.language_server_pb.LanguageServerService/GetServerConfiguration"
 # Variables the agent subprocess must never inherit from the bridge's own environment.
-_PRIVATE_ENV = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USERS")
+_PRIVATE_ENV = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN_FILE", "TELEGRAM_ALLOWED_USERS")
 
 
 class DaemonClient:
