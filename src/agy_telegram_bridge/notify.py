@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Dict, Mapping, Optional
 
 from .config import ConfigError, Settings
+from .formatting import clip_utf16
 
 DEFAULT_ENV_FILE = Path.home() / ".config" / "agy-telegram-bridge" / "env"
 MAX_LEN = 4096
@@ -50,7 +51,7 @@ def parse_env_file(path: Path) -> Dict[str, str]:
 
 
 def send(token: str, chat_id: int, text: str, timeout: float = 10.0) -> None:
-    body = json.dumps({"chat_id": chat_id, "text": text[:MAX_LEN], "disable_web_page_preview": True}).encode()
+    body = json.dumps({"chat_id": chat_id, "text": clip_utf16(text, MAX_LEN), "disable_web_page_preview": True}).encode()
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/sendMessage",
         data=body,
@@ -60,8 +61,10 @@ def send(token: str, chat_id: int, text: str, timeout: float = 10.0) -> None:
         with urllib.request.urlopen(req, timeout=timeout):
             return
     except urllib.error.HTTPError as e:
+        code = e.code
+        e.close()
         # Never include the URL (it embeds the token) in error messages.
-        raise NotifyError(f"Telegram returned HTTP {e.code} for user {chat_id}") from None
+        raise NotifyError(f"Telegram returned HTTP {code} for user {chat_id}") from None
     except (urllib.error.URLError, OSError) as e:
         raise NotifyError(f"network error for user {chat_id}: {type(e).__name__}") from None
 

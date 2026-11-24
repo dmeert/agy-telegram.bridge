@@ -23,7 +23,14 @@ class GfmToHtml(unittest.TestCase):
     def test_code_is_escaped_and_protected_from_markup(self):
         out = fmt.gfm_to_html("`**x** <y>`\n```py\nprint('<a>')\n```")
         self.assertIn("<code>**x** &lt;y&gt;</code>", out)
-        self.assertIn("<pre><code>print(&#x27;&lt;a&gt;&#x27;)</code></pre>", out)
+        self.assertIn("<pre><code>print('&lt;a&gt;')</code></pre>", out)
+
+    def test_links_with_balanced_parentheses_stay_intact(self):
+        out = fmt.gfm_to_html("See [Python](https://en.wikipedia.org/wiki/Python_(programming_language)).")
+        self.assertEqual(
+            out,
+            'See <a href="https://en.wikipedia.org/wiki/Python_(programming_language)">Python</a>.',
+        )
 
     def test_file_links_become_pills_and_http_links_stay_links(self):
         out = fmt.gfm_to_html("[a.py](file:///tmp/a.py) [site](https://example.com/?q=1&r=2)")
@@ -45,11 +52,25 @@ class SplitChunks(unittest.TestCase):
         self.assertEqual("".join(c.replace("\n", "") for c in chunks), text.replace("\n", ""))
 
     def test_code_fence_is_closed_and_reopened(self):
-        code = "```\n" + "\n".join(f"line {i}" for i in range(400)) + "\n```"
+        code = "```python\n" + "\n".join(f"line {i}" for i in range(400)) + "\n```"
         chunks = fmt.split_chunks(code, limit=500)
         self.assertGreater(len(chunks), 1)
         for c in chunks:
             self.assertEqual(c.count("```") % 2, 0, c[:40])
+        self.assertTrue(chunks[1].startswith("```python\n"))
+
+    def test_inline_triple_backticks_do_not_open_fences(self):
+        prose = "Use ` ``` ` for code.\n\n" + "\n\n".join(f"para {i} " + "w" * 120 for i in range(15))
+        chunks = fmt.split_chunks(prose, limit=500)
+        self.assertGreater(len(chunks), 1)
+        self.assertFalse(chunks[1].startswith("```"))
+
+    def test_entity_heavy_chunk_stays_within_telegram_html_limit(self):
+        xml = "```xml\n" + "\n".join(f"<item id='{i}'>a & b</item>" for i in range(180)) + "\n```"
+        chunks = fmt.split_chunks(xml)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(len(fmt.gfm_to_html(c)), fmt.TELEGRAM_LIMIT)
 
 
 class Buttons(unittest.TestCase):
@@ -169,6 +190,19 @@ class Notify(unittest.TestCase):
                 self.assertEqual(notify.main(["--env-file", str(env), "x" * 5000]), 0)
         self.assertEqual([m["chat_id"] for m in seen], [5, 7])
         self.assertTrue(all(len(m["text"]) == 4096 for m in seen))
+
+    def test_truncates_by_utf16_units_for_surrogate_pair_emoji(self):
+        seen = []
+
+        def fake_urlopen(req, timeout):
+            seen.append(json.loads(req.data))
+            return io.BytesIO(b"{}")
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            notify.send("1:abc", 42, "a" + "🚨" * 3000)
+        sent = seen[0]["text"]
+        self.assertLessEqual(len(sent.encode("utf-16-le")) // 2, 4096)
+        self.assertEqual(len(sent.encode("utf-16-le")) // 2, 4095)
 
     def test_http_error_never_leaks_token(self):
         err = urllib.error.HTTPError("https://api.telegram.org/bot1:SECRET/sendMessage", 401, "no", {}, None)

@@ -6,12 +6,15 @@ import html
 import json
 import os
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 TELEGRAM_LIMIT = 4096
 CHUNK_LIMIT = 3800
 
 ButtonRows = List[List[Tuple[str, str]]]  # rows of (label, text sent to the agent when tapped)
+
+_FENCE_LINE = re.compile(r"(?m)^[ \t]*```([^\n`]*)$")
+_LINK_RE = re.compile(r"\[([^\]]+)\]\(\s*((?:[^()\s]|\([^()\s]*\))+)\s*\)")
 
 
 def gfm_to_html(text: str) -> str:
@@ -28,20 +31,20 @@ def gfm_to_html(text: str) -> str:
 
     out = re.sub(
         r"```[^\n`]*\n(.*?)```",
-        lambda m: keep(f"<pre><code>{html.escape(m.group(1).strip(chr(10)))}</code></pre>"),
+        lambda m: keep(f"<pre><code>{html.escape(m.group(1).strip(chr(10)), quote=False)}</code></pre>"),
         text,
         flags=re.DOTALL,
     )
-    out = re.sub(r"`([^`\n]+)`", lambda m: keep(f"<code>{html.escape(m.group(1))}</code>"), out)
+    out = re.sub(r"`([^`\n]+)`", lambda m: keep(f"<code>{html.escape(m.group(1), quote=False)}</code>"), out)
 
     def link(m: re.Match) -> str:
         label, url = m.group(1).strip().strip("`"), m.group(2).strip()
         if url.startswith(("http://", "https://")):
-            return keep(f'<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>')
-        return keep(f"<code>{html.escape(label)}</code>")  # file://, conversation://, ... → plain pill
+            return keep(f'<a href="{html.escape(url, quote=True)}">{html.escape(label, quote=False)}</a>')
+        return keep(f"<code>{html.escape(label, quote=False)}</code>")  # file://, conversation://, ... → plain pill
 
-    out = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", link, out)
-    out = html.escape(out)
+    out = _LINK_RE.sub(link, out)
+    out = html.escape(out, quote=False)
     out = re.sub(r"(?m)^#{1,6}\s+(.+)$", r"<b>\1</b>", out)
     out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out)
     out = re.sub(r"(?m)^(\s*)[-*]\s+", r"\1• ", out)
@@ -50,23 +53,43 @@ def gfm_to_html(text: str) -> str:
     return out
 
 
+def _unclosed_fence(text: str) -> Optional[str]:
+    """Return the language token of an unclosed fenced block in ``text``, or ``None``."""
+    open_lang: Optional[str] = None
+    for m in _FENCE_LINE.finditer(text):
+        info = m.group(1).strip()
+        if open_lang is None:
+            open_lang = info.split()[0][:24] if info else ""
+        elif not info:
+            open_lang = None
+    return open_lang
+
+
 def split_chunks(text: str, limit: int = CHUNK_LIMIT) -> List[str]:
     """Split on paragraph/line boundaries, closing and reopening code fences across chunks."""
-    if len(text) <= limit:
+    html_budget = TELEGRAM_LIMIT if limit == CHUNK_LIMIT else None
+    if len(text) <= limit and (html_budget is None or len(gfm_to_html(text)) <= html_budget):
         return [text]
     chunks: List[str] = []
     rest = text
-    while len(rest) > limit:
-        cut = rest.rfind("\n\n", 0, limit)
-        if cut < limit // 2:
-            cut = rest.rfind("\n", 0, limit)
-        if cut < limit // 2:
-            cut = limit
-        head, rest = rest[:cut].rstrip(), rest[cut:].lstrip("\n")
-        if head.count("```") % 2:  # cut inside a fenced block
-            head += "\n```"
-            rest = "```\n" + rest
-        chunks.append(head)
+    while len(rest) > limit or (html_budget is not None and len(gfm_to_html(rest)) > html_budget):
+        cap = min(len(rest), limit)
+        while True:
+            cut = rest.rfind("\n\n", 0, cap)
+            if cut < cap // 2:
+                cut = rest.rfind("\n", 0, cap)
+            if cut < cap // 2:
+                cut = cap
+            head = rest[:cut].rstrip()
+            lang = _unclosed_fence(head)
+            closed = f"{head}\n```" if lang is not None else head
+            if html_budget is None or len(gfm_to_html(closed)) <= html_budget or cap <= 64:
+                break
+            cap = max(64, int(cap * 0.75))
+        rest = rest[cut:].lstrip("\n")
+        if lang is not None:
+            rest = f"```{lang}\n" + rest
+        chunks.append(closed)
     if rest:
         chunks.append(rest)
     return chunks
@@ -74,6 +97,14 @@ def split_chunks(text: str, limit: int = CHUNK_LIMIT) -> List[str]:
 
 def clip_utf8(text: str, max_bytes: int) -> str:
     return text.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def clip_utf16(text: str, max_units: int = TELEGRAM_LIMIT) -> str:
+    """Clip ``text`` to ``max_units`` UTF-16 code units (Telegram's length metric)."""
+    encoded = text.encode("utf-16-le")
+    if len(encoded) <= max_units * 2:
+        return text
+    return encoded[: max_units * 2].decode("utf-16-le", errors="ignore")
 
 
 _BUTTON_JSON = re.compile(r"<!--\s*BUTTONS:\s*(.*?)\s*-->", re.DOTALL)
